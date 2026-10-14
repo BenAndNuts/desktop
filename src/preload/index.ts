@@ -73,6 +73,8 @@ const api = {
   // Config
   getConfig: () => ipcRenderer.invoke('get:config'),
   setConfig: (config: Record<string, any>) => ipcRenderer.invoke('set:config', config),
+  // Folders, models and prompts of the default connection (for Spotlight defaults)
+  getSpotlightContext: () => ipcRenderer.invoke('spotlight:getContext'),
 
   // Python/uv
   installPython: () => ipcRenderer.invoke('install:python'),

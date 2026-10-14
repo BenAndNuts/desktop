@@ -32,6 +32,12 @@
     defaultInstallDir = await window.electronAPI.getInstallDir()
     installDirPath = cfg?.installDir || defaultInstallDir
 
+    // Lists for Spotlight defaults (null when not signed in)
+    window.electronAPI
+      .getSpotlightContext()
+      .then((ctx: SpotlightContext | null) => (spotlightContext = ctx))
+      .catch(() => (spotlightContext = null))
+
     // Load languages
     languages = await getLanguages()
     selectedLanguage = cfg?.language ?? localStorage.getItem('locale') ?? 'en-US'
@@ -113,6 +119,50 @@
 
   // Spotlight clipboard paste
   let spotlightClipboardPaste = $state(true)
+  let spotlightCaptureSelection = $state(true)
+
+  // Spotlight defaults (folder / model / prompt), listed from the default connection
+  type SpotlightContext = {
+    models: { id: string; name: string; custom: boolean }[]
+    folders: { id: string; name: string; path: string }[]
+    prompts: { id: string; command: string; name: string }[]
+  }
+  type SpotlightDefaultKey =
+    | 'spotlightDefaultFolderId'
+    | 'spotlightDefaultModelId'
+    | 'spotlightDefaultPromptId'
+  let spotlightContext = $state<SpotlightContext | null | undefined>(undefined)
+  const spotlightDefaultFields = $derived(
+    spotlightContext
+      ? [
+          {
+            key: 'spotlightDefaultFolderId' as SpotlightDefaultKey,
+            label: 'Folder',
+            none: 'No folder',
+            options: spotlightContext.folders.map((f) => ({ id: f.id, label: f.path }))
+          },
+          {
+            key: 'spotlightDefaultModelId' as SpotlightDefaultKey,
+            label: 'Model',
+            none: 'Default model',
+            options: [
+              ...spotlightContext.models.filter((m) => m.custom),
+              ...spotlightContext.models.filter((m) => !m.custom)
+            ].map((m) => ({ id: m.id, label: m.custom ? `${m.name} (expert)` : m.name }))
+          },
+          {
+            key: 'spotlightDefaultPromptId' as SpotlightDefaultKey,
+            label: 'Prompt',
+            none: 'No prompt',
+            options: spotlightContext.prompts.map((p) => ({ id: p.id, label: `${p.name} (/${p.command})` }))
+          }
+        ]
+      : []
+  )
+  const setSpotlightDefault = async (key: SpotlightDefaultKey, value: string): Promise<void> => {
+    await window.electronAPI.setConfig({ [key]: value || null })
+    config.set(await window.electronAPI.getConfig())
+  }
 
   // Keep shortcut value in sync with config store
   $effect(() => {
@@ -124,6 +174,9 @@
   $effect(() => {
     if ($config?.spotlightShortcut !== undefined) {
       spotlightShortcutValue = $config.spotlightShortcut ?? ''
+    }
+    if ($config?.spotlightCaptureSelection !== undefined) {
+      spotlightCaptureSelection = $config.spotlightCaptureSelection ?? true
     }
     if ($config?.spotlightClipboardPaste !== undefined) {
       spotlightClipboardPaste = $config.spotlightClipboardPaste ?? true
@@ -524,6 +577,24 @@
     </div>
   </div>
 
+  {#if navigator.userAgent.includes('Windows')}
+    <div class="py-4 flex items-center justify-between">
+      <div>
+        <div class="text-[13px] opacity-70">Capture Selected Text</div>
+        <div class="text-[11px] opacity-25 mt-0.5">Put the text selected in the current app into Spotlight (your clipboard is restored)</div>
+      </div>
+      <Switch
+        checked={spotlightCaptureSelection}
+        label="Toggle selected text capture"
+        onchange={async (value) => {
+          spotlightCaptureSelection = value
+          await window.electronAPI.setConfig({ spotlightCaptureSelection: value })
+          config.set(await window.electronAPI.getConfig())
+        }}
+      />
+    </div>
+  {/if}
+
   <div class="py-4 flex items-center justify-between">
     <div>
       <div class="text-[13px] opacity-70">Clipboard Auto-Paste</div>
@@ -538,6 +609,48 @@
         config.set(await window.electronAPI.getConfig())
       }}
     />
+  </div>
+
+  <div class="py-4">
+    <div class="text-[13px] opacity-70">Spotlight Defaults</div>
+    <div class="text-[11px] opacity-25 mt-0.5">
+      Preselected each time Spotlight opens. Lists come from your default connection.
+    </div>
+    {#if spotlightContext === null}
+      <div class="text-[11px] opacity-40 mt-2">Sign in to your default connection to choose defaults.</div>
+    {:else}
+      <div class="mt-3 flex flex-col gap-2">
+        {#each spotlightDefaultFields as field (field.key)}
+          <div class="flex items-center justify-between">
+            <div class="text-[12px] opacity-50">{field.label}</div>
+            <select
+              class="bg-black/[0.04] dark:bg-white/[0.06] text-[12px] text-[#1d1d1f] dark:text-[#fafafa] px-3 py-1.5 border-none outline-none rounded-xl opacity-60 max-w-[220px]"
+              onchange={(e) => setSpotlightDefault(field.key, (e.target as HTMLSelectElement).value)}
+            >
+              <option value="" selected={!$config?.[field.key]}>{field.none}</option>
+              {#each field.options as opt (opt.id)}
+                <option value={opt.id} selected={$config?.[field.key] === opt.id}>{opt.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    <div class="mt-2 flex items-center justify-between">
+      <div class="text-[12px] opacity-50">Enter key</div>
+      <select
+        class="bg-black/[0.04] dark:bg-white/[0.06] text-[12px] text-[#1d1d1f] dark:text-[#fafafa] px-3 py-1.5 border-none outline-none rounded-xl opacity-60 max-w-[220px]"
+        onchange={async (e) => {
+          await window.electronAPI.setConfig({
+            spotlightSubmitMode: (e.target as HTMLSelectElement).value
+          })
+          config.set(await window.electronAPI.getConfig())
+        }}
+      >
+        <option value="send" selected={$config?.spotlightSubmitMode !== 'review'}>Send right away (⇧↵ opens the chat)</option>
+        <option value="review" selected={$config?.spotlightSubmitMode === 'review'}>Open the chat to review (⇧↵ sends)</option>
+      </select>
+    </div>
   </div>
 
   <div class="py-4 flex items-center justify-between">

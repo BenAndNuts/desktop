@@ -839,6 +839,13 @@ export interface AppConfig {
   showSidebar: boolean
   spotlightPosition: { x: number; y: number } | null
   spotlightClipboardPaste: boolean
+  spotlightCaptureSelection: boolean
+  // Spotlight defaults (Open WebUI ids on the default connection)
+  spotlightDefaultFolderId: string | null
+  spotlightDefaultModelId: string | null
+  spotlightDefaultPromptId: string | null
+  // 'send' = send right away, 'review' = open the chat pre-filled
+  spotlightSubmitMode: 'send' | 'review'
   voiceInputShortcut: string
   voiceInputEnabled: boolean
   callShortcut: string
@@ -876,6 +883,11 @@ const DEFAULT_CONFIG: AppConfig = {
   showSidebar: false,
   spotlightPosition: null,
   spotlightClipboardPaste: true,
+  spotlightCaptureSelection: true,
+  spotlightDefaultFolderId: null,
+  spotlightDefaultModelId: null,
+  spotlightDefaultPromptId: null,
+  spotlightSubmitMode: 'send',
   voiceInputShortcut: 'Shift+CommandOrControl+Space',
   voiceInputEnabled: true,
   callShortcut: 'Shift+CommandOrControl+C',

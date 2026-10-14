@@ -359,6 +359,58 @@
     }
   }
 
+  // Spotlight "send" mode with a folder/model: Open WebUI has no URL
+  // parameter to auto-submit, so once the pre-filled text is in the chat
+  // input, click Send. Waits while a dialog is open (e.g. prompt input
+  // variables) and gives up after 20s, leaving the text for the user.
+  const autoSubmitInWebview = (connId: string, path: string): void => {
+    const target = new URL(path, 'http://x')
+    const snippet = (target.searchParams.get('q') ?? '')
+      .replace(/{{[^}]*}}/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 24)
+    const script = `(async () => {
+      const pathname = ${JSON.stringify(target.pathname)}
+      const snippet = ${JSON.stringify(snippet)}
+      const deadline = Date.now() + 20000
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 150))
+        if (location.pathname !== pathname) continue
+        if (document.querySelector('[role="dialog"][aria-modal="true"]')) continue
+        const input = document.getElementById('chat-input')
+        const btn = document.getElementById('send-message-button')
+        if (!input || !btn || btn.disabled) continue
+        const text = (input.innerText || input.value || '').replace(/\\s+/g, ' ')
+        if (!text.trim() || (snippet && !text.includes(snippet))) continue
+        btn.click()
+        return true
+      }
+      return false
+    })()`
+
+    type Webview = HTMLElement & { executeJavaScript: (code: string) => Promise<unknown> }
+    const run = (wv: Webview): void => {
+      try {
+        wv.executeJavaScript(script).catch(() => {})
+      } catch {
+        // Not ready yet — run once the page has loaded
+        const onReady = (): void => {
+          wv.removeEventListener('dom-ready', onReady)
+          wv.executeJavaScript(script).catch(() => {})
+        }
+        wv.addEventListener('dom-ready', onReady)
+      }
+    }
+
+    requestAnimationFrame(() => {
+      const wv = document
+        .querySelector('.content-webview-container')
+        ?.querySelector<Webview>(`webview[partition="persist:connection-${connId}"]`)
+      if (wv) run(wv)
+    })
+  }
+
   // Listen for events from main process
   onMount(() => {
     window.electronAPI.onData((data: any) => {
@@ -401,6 +453,36 @@
         requestAnimationFrame(() => {
           sendToWebview({ type: 'query', data: { query, files } }, connId)
         })
+        return
+      }
+
+      // ── Spotlight: open a new chat in a folder / with a model ──
+      // The query is pre-filled (not sent) so the user can review it.
+      if (data.type === 'navigate' && data.data?.path) {
+        const connId = data.data.connectionId ?? ''
+        const path = data.data.path
+        const baseUrl = data.data.url ?? ''
+
+        if (!openConnections.has(connId)) {
+          // Webview not loaded yet — load it directly at the target path
+          const target = `${baseUrl.replace(/\/$/, '')}${path}`
+          openConnections.set(connId, target)
+          openConnections = new Map(openConnections)
+          connectedUrl = target
+          activeConnectionId = connId
+          if (installPhase !== 'working') view = 'connected'
+          if (data.data.autoSubmit) autoSubmitInWebview(connId, path)
+          return
+        }
+
+        connectedUrl = openConnections.get(connId)!
+        activeConnectionId = connId
+        if (installPhase !== 'working') view = 'connected'
+
+        requestAnimationFrame(() => {
+          sendToWebview({ type: 'page:navigate', data: { path } }, connId)
+        })
+        if (data.data.autoSubmit) autoSubmitInWebview(connId, path)
         return
       }
 

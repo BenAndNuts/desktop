@@ -15,9 +15,11 @@ import {
   Menu,
   ipcMain,
   Tray,
-  dialog
+  dialog,
+  webContents
 } from 'electron'
 import path, { join } from 'path'
+import { captureSelectedText, getForegroundApp, type SourceApp } from './utils/selection'
 import { readFile, statfs } from 'fs/promises'
 
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -250,11 +252,22 @@ const registerShortcuts = (globalAccel?: string, spotlightAccel?: string, voiceI
 
   // Spotlight shortcut – toggle the spotlight input bar
   if (spotlightAccel) {
-    tryRegisterShortcut(spotlightAccel, 'Spotlight', () => {
-      const text = CONFIG?.spotlightClipboardPaste !== false
-        ? (clipboard.readText()?.trim() || '')
-        : ''
-      toggleSpotlight(text)
+    tryRegisterShortcut(spotlightAccel, 'Spotlight', async () => {
+      // Closing an open Spotlight needs no capture
+      if (spotlightWindow && !spotlightWindow.isDestroyed() && spotlightWindow.isVisible()) {
+        toggleSpotlight()
+        return
+      }
+      // Note the foreground app before Spotlight takes focus
+      const sourceApp = await getForegroundApp()
+      // Prefer the text selected in the foreground app (copied for us and
+      // the clipboard restored), then fall back to the clipboard.
+      const selected =
+        CONFIG?.spotlightCaptureSelection !== false ? await captureSelectedText() : null
+      const text =
+        selected ??
+        (CONFIG?.spotlightClipboardPaste !== false ? clipboard.readText()?.trim() || '' : '')
+      toggleSpotlight(text, sourceApp)
     })
   }
 
@@ -344,7 +357,11 @@ function createSpotlightWindow(): BrowserWindow {
   return spotlightWindow
 }
 
-function showAndFocusSpotlight(win: BrowserWindow, initialQuery?: string): void {
+function showAndFocusSpotlight(
+  win: BrowserWindow,
+  initialQuery?: string,
+  sourceApp?: SourceApp | null
+): void {
   // On macOS, avoid `app.focus({ steal: true })` — it activates the whole
   // application and causes the window manager to switch back to whichever
   // Space the app was originally launched on (#179).  Instead, ensure the
@@ -373,21 +390,28 @@ function showAndFocusSpotlight(win: BrowserWindow, initialQuery?: string): void 
   win.webContents.send('spotlight:init', {
     barOffset: spotlightBarOffset,
     screenSize: { width: sw, height: sh },
-    query: initialQuery || ''
+    query: initialQuery || '',
+    sourceApp: sourceApp ?? null,
+    defaults: {
+      folderId: CONFIG?.spotlightDefaultFolderId ?? null,
+      modelId: CONFIG?.spotlightDefaultModelId ?? null,
+      promptId: CONFIG?.spotlightDefaultPromptId ?? null
+    },
+    submitMode: CONFIG?.spotlightSubmitMode === 'review' ? 'review' : 'send'
   })
 }
 
-function toggleSpotlight(selectedText?: string): void {
+function toggleSpotlight(selectedText?: string, sourceApp?: SourceApp | null): void {
   if (spotlightWindow && !spotlightWindow.isDestroyed()) {
     if (spotlightWindow.isVisible()) {
       spotlightWindow.hide()
     } else {
-      showAndFocusSpotlight(spotlightWindow, selectedText)
+      showAndFocusSpotlight(spotlightWindow, selectedText, sourceApp)
     }
   } else {
     const win = createSpotlightWindow()
     win.once('ready-to-show', () => {
-      showAndFocusSpotlight(win, selectedText)
+      showAndFocusSpotlight(win, selectedText, sourceApp)
     })
   }
 }
@@ -1173,6 +1197,150 @@ const sendToRenderer = (type: string, data?: any) => {
   mainWindow?.webContents.send('main:data', { type, data })
 }
 
+// Read the Open WebUI auth token from the webview guests' localStorage —
+// always the session the user is currently signed in with.
+const getWebviewToken = async (): Promise<string> => {
+  try {
+    for (const contents of webContents.getAllWebContents()) {
+      try {
+        if (contents.getType() === 'webview' && !contents.isDestroyed()) {
+          const t = await contents.executeJavaScript(`localStorage.getItem('token') || ''`)
+          if (t) return t
+        }
+      } catch {
+        // Skip inaccessible webContents
+      }
+    }
+  } catch {
+    log.warn('getAuthToken — could not extract token from webviews')
+  }
+  return ''
+}
+
+// Resolve the Open WebUI auth token: the live webview session first, then
+// the token relayed from the webview at sign-in (may be stale after a
+// server update or a new sign-in).
+const getAuthToken = async (): Promise<string> => (await getWebviewToken()) || AUTH_TOKEN || ''
+
+type SpotlightModel = { id: string; name: string; custom: boolean }
+type SpotlightPrompt = { id: string; command: string; name: string; content: string }
+type SpotlightFolder = { id: string; name: string; path: string }
+
+// Fetch the models, folders (projects) and prompts available on the default
+// connection so Spotlight can offer them before a chat is started.
+// Returns null when there is no connection or the user isn't signed in.
+const getSpotlightContext = async (): Promise<{
+  models: SpotlightModel[]
+  folders: SpotlightFolder[]
+  prompts: SpotlightPrompt[]
+} | null> => {
+  const conn = await getDefaultConnection()
+  if (!conn) return null
+  // Try the live webview session, then the relayed token if it differs
+  const candidates = [...new Set([await getWebviewToken(), AUTH_TOKEN ?? ''].filter(Boolean))]
+  if (candidates.length === 0) {
+    log.warn('spotlight:getContext — no auth token (not signed in?)')
+    return null
+  }
+
+  const url = resolveConnectionUrl(conn)
+  let token = candidates[0]
+  for (const t of candidates) {
+    const res = await fetch(`${url}/api/v1/auths/`, {
+      headers: { Accept: 'application/json', Authorization: `Bearer ${t}` },
+      signal: AbortSignal.timeout(10000)
+    }).catch((err) => {
+      log.warn('spotlight:getContext — server unreachable:', err)
+      return null
+    })
+    if (!res) return null
+    if (res.ok) {
+      token = t
+      break
+    }
+    log.warn(`spotlight:getContext — token rejected (HTTP ${res.status})`)
+    if (t === candidates[candidates.length - 1]) return null
+  }
+
+  const headers = { Accept: 'application/json', Authorization: `Bearer ${token}` }
+  const getJson = async (path: string): Promise<unknown> => {
+    // /api/models queries every model provider and can be slow
+    const res = await fetch(`${url}${path}`, { headers, signal: AbortSignal.timeout(20000) })
+    if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`)
+    return res.json()
+  }
+
+  const [modelsRes, foldersRes, promptsRes] = await Promise.allSettled([
+    getJson('/api/models'),
+    getJson('/api/v1/folders/'),
+    getJson('/api/v1/prompts/')
+  ])
+
+  type ApiModel = {
+    id?: string
+    name?: string
+    info?: { base_model_id?: string | null; meta?: { hidden?: boolean } }
+  }
+  const models: SpotlightModel[] =
+    modelsRes.status === 'fulfilled'
+      ? ((modelsRes.value as { data?: ApiModel[] })?.data ?? [])
+          .filter((m) => m?.id && !(m?.info?.meta?.hidden ?? false))
+          .map((m) => ({
+            id: m.id as string,
+            name: m.name || (m.id as string),
+            // Workspace models built on a base model = "experts" (own system prompt)
+            custom: !!m.info?.base_model_id
+          }))
+      : []
+  if (modelsRes.status === 'rejected') log.warn('spotlight:getContext — models:', modelsRes.reason)
+
+  let folders: SpotlightFolder[] = []
+  if (foldersRes.status === 'fulfilled' && Array.isArray(foldersRes.value)) {
+    const raw: { id: string; name: string; parent_id?: string | null }[] = foldersRes.value
+    const byId = new Map(raw.map((f) => [f.id, f]))
+    // Build a "Parent / Child" path for nested folders (cycle-safe)
+    const pathOf = (f: { id: string; name: string; parent_id?: string | null }): string => {
+      const parts = [f.name]
+      const seen = new Set([f.id])
+      let parent = f.parent_id ? byId.get(f.parent_id) : undefined
+      while (parent && !seen.has(parent.id)) {
+        parts.unshift(parent.name)
+        seen.add(parent.id)
+        parent = parent.parent_id ? byId.get(parent.parent_id) : undefined
+      }
+      return parts.join(' / ')
+    }
+    folders = raw
+      .map((f) => ({ id: f.id, name: f.name, path: pathOf(f) }))
+      .sort((a, b) => a.path.localeCompare(b.path))
+  } else if (foldersRes.status === 'rejected') {
+    log.warn('spotlight:getContext — folders:', foldersRes.reason)
+  }
+
+  type ApiPrompt = {
+    id?: string | null
+    command?: string
+    name?: string
+    content?: string
+    is_active?: boolean | null
+  }
+  const prompts: SpotlightPrompt[] =
+    promptsRes.status === 'fulfilled' && Array.isArray(promptsRes.value)
+      ? (promptsRes.value as ApiPrompt[])
+          .filter((p) => p?.command && p?.content && p.is_active !== false)
+          .map((p) => ({
+            id: p.id || (p.command as string),
+            command: (p.command as string).replace(/^\//, ''),
+            name: p.name || (p.command as string),
+            content: p.content as string
+          }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+      : []
+  if (promptsRes.status === 'rejected') log.warn('spotlight:getContext — prompts:', promptsRes.reason)
+
+  return { models, folders, prompts }
+}
+
 // ─── App Lifecycle ──────────────────────────────────────
 
 const gotTheLock = app.requestSingleInstanceLock()
@@ -1611,7 +1779,18 @@ if (!gotTheLock) {
     ipcMain.handle('app:reset', () => resetAppHandler())
 
     // Spotlight
-    ipcMain.handle('spotlight:submit', async (_event, query: string, images?: string[]) => {
+    ipcMain.handle(
+      'spotlight:submit',
+      async (
+        _event,
+        query: string,
+        images?: string[],
+        target?: {
+          folderId?: string | null
+          modelId?: string | null
+          mode?: 'send' | 'review'
+        }
+      ) => {
       const conn = await getDefaultConnection()
       if (!conn) {
         mainWindow?.show()
@@ -1620,6 +1799,40 @@ if (!gotTheLock) {
       }
 
       const url = resolveConnectionUrl(conn)
+      const mode = target?.mode === 'review' ? 'review' : 'send'
+      const hasTarget = !!(target?.folderId || target?.modelId)
+
+      // Open a new chat in the chosen folder / with the chosen model, the
+      // text pre-filled — and, in 'send' mode, submitted once it's there.
+      // Relies on Open WebUI's existing /folders/:id route and ?models= /
+      // ?q= parameters, so no server-side change is required.
+      // Screenshots can't travel through a URL: they keep the default flow.
+      if (!images?.length && (hasTarget || mode === 'review')) {
+        const params = new URLSearchParams()
+        if (target?.modelId) params.set('models', target.modelId)
+        if (query) {
+          params.set('q', query)
+          // Open WebUI <= 0.11 auto-submits ?q= unless submit=false (0.12+
+          // ignores it). Sending is always done by autoSubmit below, so the
+          // behaviour is the same on every server version.
+          params.set('submit', 'false')
+        }
+        const base = target?.folderId ? `/folders/${encodeURIComponent(target.folderId)}` : '/'
+        const qs = params.toString()
+        sendToRenderer('navigate', {
+          connectionId: conn.id,
+          url,
+          path: qs ? `${base}?${qs}` : base,
+          autoSubmit: mode === 'send' && !!query
+        })
+
+        spotlightWindow?.hide()
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.show()
+          mainWindow.focus()
+        }
+        return
+      }
 
       // Build files payload from screenshot images
       const files = images?.map((dataUrl, i) => ({
@@ -1635,6 +1848,15 @@ if (!gotTheLock) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show()
         mainWindow.focus()
+      }
+      }
+    )
+    ipcMain.handle('spotlight:getContext', async () => {
+      try {
+        return await getSpotlightContext()
+      } catch (err) {
+        log.warn('spotlight:getContext failed:', err)
+        return null
       }
     })
     ipcMain.handle('spotlight:close', () => {
@@ -1751,29 +1973,8 @@ if (!gotTheLock) {
 
         const url = resolveConnectionUrl(conn)
 
-        // Use stored auth token (relayed from webview), fall back to renderer-provided or contentWindow
-        let token = AUTH_TOKEN || rendererToken || ''
-        if (!token) {
-          // Scan all webContents to find the Open WebUI webview and read its token
-          try {
-            const { webContents: wc } = require('electron')
-            const allContents = wc.getAllWebContents()
-            for (const contents of allContents) {
-              try {
-                if (contents.getType() === 'webview' && !contents.isDestroyed()) {
-                  const t = await contents.executeJavaScript(
-                    `localStorage.getItem('token') || ''`
-                  )
-                  if (t) { token = t; break }
-                }
-              } catch {
-                // Skip inaccessible webContents
-              }
-            }
-          } catch {
-            log.warn('voiceInput:transcribe — could not extract token from webviews')
-          }
-        }
+        // Use stored auth token (relayed from webview), fall back to renderer-provided or webview scan
+        const token = AUTH_TOKEN || rendererToken || (await getAuthToken())
 
         if (!token) {
           throw new Error('Not authenticated. Open a connection and sign in before using voice input.')

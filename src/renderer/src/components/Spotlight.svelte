@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import logoImage from '../lib/assets/images/splash.png'
 
   let inputEl = $state<HTMLInputElement | null>(null)
@@ -18,6 +18,144 @@
 
   const api = window.spotlightAPI
 
+  // ─── Folder & model pickers ───
+  type Model = { id: string; name: string; custom: boolean }
+  type Folder = { id: string; name: string; path: string }
+  type Prompt = { id: string; command: string; name: string; content: string }
+
+  let models = $state<Model[]>([])
+  let folders = $state<Folder[]>([])
+  let prompts = $state<Prompt[]>([])
+  let contextLoaded = $state(false)
+  // Kept while the app runs so repeated Spotlight use targets the same place
+  let selectedFolderId = $state<string | null>(null)
+  let selectedModelId = $state<string | null>(null)
+  // A prompt applies to one query only; reset after each submit
+  let selectedPromptId = $state<string | null>(null)
+
+  type PickerKind = 'folder' | 'model' | 'prompt'
+  let openPicker = $state<PickerKind | null>(null)
+  let pickerFilter = $state('')
+  let pickerIndex = $state(0)
+  let pickerInputEl = $state<HTMLInputElement | null>(null)
+  let pickerListEl = $state<HTMLDivElement | null>(null)
+
+  const selectedFolder = $derived(folders.find((f) => f.id === selectedFolderId) ?? null)
+  const selectedModel = $derived(models.find((m) => m.id === selectedModelId) ?? null)
+  const selectedPrompt = $derived(prompts.find((p) => p.id === selectedPromptId) ?? null)
+  const hasTarget = $derived(!!selectedFolder || !!selectedModel)
+
+  // ─── Submit mode & source app ───
+  // 'send' = send right away, 'review' = open the chat pre-filled.
+  // Enter uses the mode from Settings, Shift+Enter the other one.
+  type SubmitMode = 'send' | 'review'
+  let submitMode = $state<SubmitMode>('send')
+  const otherMode = $derived<SubmitMode>(submitMode === 'send' ? 'review' : 'send')
+  const MODE_LABEL: Record<SubmitMode, string> = { send: 'Send', review: 'Open chat' }
+  // Shift held: Enter / click on the button use the other mode (button shows it)
+  let shiftHeld = $state(false)
+  const buttonMode = $derived<SubmitMode>(shiftHeld ? otherMode : submitMode)
+
+  let sourceApp = $state<{ name: string; icon: string | null } | null>(null)
+
+  type PickerItem = { id: string | null; label: string; sub?: string; badge?: string }
+  const NONE_LABEL: Record<PickerKind, string> = {
+    folder: 'No folder',
+    model: 'Default model',
+    prompt: 'No prompt'
+  }
+  const pickerItems = $derived.by((): PickerItem[] => {
+    const f = pickerFilter.trim().toLowerCase()
+    if (!openPicker) return []
+    const none: PickerItem = { id: null, label: NONE_LABEL[openPicker] }
+    const items: PickerItem[] =
+      openPicker === 'folder'
+        ? folders.map((x) => ({ id: x.id, label: x.path }))
+        : openPicker === 'model'
+          ? // Experts (workspace models with their own system prompt) first
+            [...models.filter((x) => x.custom), ...models.filter((x) => !x.custom)].map((x) => ({
+              id: x.id,
+              label: x.name,
+              sub: x.name !== x.id ? x.id : undefined,
+              badge: x.custom ? 'Expert' : undefined
+            }))
+          : prompts.map((x) => ({ id: x.id, label: x.name, sub: `/${x.command}` }))
+    const filtered = f
+      ? items.filter((i) => i.label.toLowerCase().includes(f) || i.sub?.toLowerCase().includes(f))
+      : items
+    return f ? filtered : [none, ...filtered]
+  })
+
+  const loadContext = async (): Promise<void> => {
+    const ctx = await api?.getContext?.().catch(() => null)
+    if (!ctx) {
+      contextLoaded = false
+      return
+    }
+    models = ctx.models ?? []
+    folders = ctx.folders ?? []
+    // Drop selections that no longer exist on the server
+    if (selectedFolderId && !folders.some((f) => f.id === selectedFolderId)) selectedFolderId = null
+    if (selectedModelId && !models.some((m) => m.id === selectedModelId)) selectedModelId = null
+    prompts = ctx.prompts ?? []
+    if (selectedPromptId && !prompts.some((p) => p.id === selectedPromptId)) selectedPromptId = null
+    contextLoaded = models.length > 0 || folders.length > 0 || prompts.length > 0
+  }
+
+  const currentId = (which: PickerKind | null): string | null =>
+    which === 'folder' ? selectedFolderId : which === 'model' ? selectedModelId : selectedPromptId
+
+  const togglePicker = async (which: PickerKind): Promise<void> => {
+    if (openPicker === which) {
+      closePicker()
+      return
+    }
+    openPicker = which
+    pickerFilter = ''
+    pickerIndex = Math.max(0, pickerItems.findIndex((i) => i.id === currentId(which)))
+    // Focus synchronously after render so fast typing isn't lost
+    await tick()
+    pickerInputEl?.focus()
+    scrollPickerIntoView()
+  }
+
+  const closePicker = (): void => {
+    openPicker = null
+    pickerFilter = ''
+    requestAnimationFrame(() => inputEl?.focus())
+  }
+
+  const choose = (item: PickerItem | undefined): void => {
+    if (!item) return
+    if (openPicker === 'folder') selectedFolderId = item.id
+    else if (openPicker === 'model') selectedModelId = item.id
+    else if (openPicker === 'prompt') selectedPromptId = item.id
+    closePicker()
+  }
+
+  const scrollPickerIntoView = (): void => {
+    pickerListEl?.querySelector<HTMLElement>(`[data-index="${pickerIndex}"]`)?.scrollIntoView({ block: 'nearest' })
+  }
+
+  const onPickerKeydown = (e: KeyboardEvent): void => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      pickerIndex = Math.min(pickerItems.length - 1, pickerIndex + 1)
+      requestAnimationFrame(scrollPickerIntoView)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      pickerIndex = Math.max(0, pickerIndex - 1)
+      requestAnimationFrame(scrollPickerIntoView)
+    } else if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault()
+      choose(pickerItems[pickerIndex])
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      closePicker()
+    }
+  }
+
   // ─── Error Toast ───
   let errorTimer: ReturnType<typeof setTimeout> | null = null
   const showError = (msg: string, duration = 4000) => {
@@ -27,16 +165,32 @@
   }
 
   // ─── Submit ───
-  const submit = () => {
-    const q = query.trim()
-    if (!q && images.length === 0) return
+  const submit = (mode: SubmitMode = submitMode): void => {
+    let q = query.trim()
+    if (!q && images.length === 0 && !selectedPrompt) return
+    if (selectedPrompt) {
+      // {{CLIPBOARD}} is where Open WebUI prompts expect the input text;
+      // other variables are resolved by Open WebUI when the text is set.
+      const content = selectedPrompt.content
+      q = content.includes('{{CLIPBOARD}}')
+        ? content.replaceAll('{{CLIPBOARD}}', () => q)
+        : q
+          ? `${content}\n\n${q}`
+          : content
+    }
     if (!api) return
     // Svelte 5 $state creates Proxy objects that Electron IPC can't serialize.
     // Spread into a plain array of plain strings for structured clone.
     const plainImages = images.length > 0 ? [...images].map((s) => s.slice(0)) : undefined
-    api.submitQuery(q, plainImages)
+    api.submitQuery(q, plainImages, {
+      folderId: selectedFolder?.id ?? null,
+      modelId: selectedModel?.id ?? null,
+      mode
+    })
     query = ''
     images = []
+    openPicker = null
+    selectedPromptId = null
   }
 
   // ─── Bar Dragging ───
@@ -46,7 +200,13 @@
   const onBarMouseDown = (e: MouseEvent) => {
     // Only drag from the bar background, not from input or buttons
     const target = e.target as HTMLElement
-    if (target.tagName === 'INPUT' || target.closest('button') || target.closest('.preview')) return
+    if (
+      target.tagName === 'INPUT' ||
+      target.closest('button') ||
+      target.closest('.preview') ||
+      target.closest('.picker-panel')
+    )
+      return
     e.preventDefault()
     barDragging = true
     barDragStart = { mx: e.clientX, my: e.clientY, bx: barX, by: barY }
@@ -136,6 +296,14 @@
     })
 
     api?.onInit?.((data) => {
+      openPicker = null
+      sourceApp = data.sourceApp ?? null
+      submitMode = data.submitMode === 'review' ? 'review' : 'send'
+      // Start from the defaults chosen in Settings (validated once loaded)
+      selectedFolderId = data.defaults?.folderId ?? null
+      selectedModelId = data.defaults?.modelId ?? null
+      selectedPromptId = data.defaults?.promptId ?? null
+      loadContext()
       if (data.screenSize) {
         screenW = data.screenSize.width
         screenH = data.screenSize.height
@@ -161,7 +329,14 @@
 </script>
 
 <svelte:window
-  onkeydown={(e) => e.key === 'Escape' && api?.closeSpotlight()}
+  onkeydown={(e) => {
+    shiftHeld = e.shiftKey
+    if (e.key !== 'Escape') return
+    if (openPicker) closePicker()
+    else api?.closeSpotlight()
+  }}
+  onkeyup={(e) => (shiftHeld = e.shiftKey)}
+  onblur={() => (shiftHeld = false)}
   onmousemove={onMouseMove}
   onmouseup={onMouseUp}
 />
@@ -207,6 +382,13 @@
       </div>
     {/if}
 
+    {#if sourceApp}
+      <div class="source-app">
+        {#if sourceApp.icon}<img src={sourceApp.icon} alt="" />{/if}
+        <span>Working with <strong>{sourceApp.name}</strong></span>
+      </div>
+    {/if}
+
     <div class="input-row">
       <img class="logo" src={logoImage} alt="" />
 
@@ -220,18 +402,123 @@
         onkeydown={(e) => {
           if (e.key === 'Enter' && !e.isComposing) {
             e.preventDefault()
-            submit()
+            submit(e.shiftKey ? otherMode : submitMode)
           }
         }}
       />
 
-      <button class="send" class:active={query.trim().length > 0 || images.length > 0} aria-label="Send" onclick={submit}>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 19V5" />
-          <path d="M5 12l7-7 7 7" />
-        </svg>
+      <button class="send" class:active={query.trim().length > 0 || images.length > 0 || !!selectedPrompt} aria-label={MODE_LABEL[buttonMode]} title="{MODE_LABEL[submitMode]} (click / ↵) · {MODE_LABEL[otherMode]} (⇧ click / ⇧↵)" onclick={(e) => submit(e.shiftKey ? otherMode : submitMode)}>
+        {#if buttonMode === 'send'}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 19V5" />
+            <path d="M5 12l7-7 7 7" />
+          </svg>
+        {:else}
+          <!-- Open chat: pre-fill without sending -->
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 4h6v6" />
+            <path d="M20 4l-9 9" />
+            <path d="M18 14v4a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2h4" />
+          </svg>
+        {/if}
       </button>
     </div>
+
+    {#if contextLoaded}
+      <div class="context-row">
+        {#if folders.length > 0}
+          <button
+            class="chip"
+            class:selected={!!selectedFolder}
+            class:open={openPicker === 'folder'}
+            onclick={() => togglePicker('folder')}
+            title="Open the chat in a folder"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
+            </svg>
+            <span class="chip-label">{selectedFolder?.path ?? 'No folder'}</span>
+            <svg class="chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+        {/if}
+        {#if models.length > 0}
+          <button
+            class="chip"
+            class:selected={!!selectedModel}
+            class:open={openPicker === 'model'}
+            onclick={() => togglePicker('model')}
+            title="Choose the model for this chat"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" /><path d="M12 12l8-4.5" /><path d="M12 12v9" /><path d="M12 12L4 7.5" />
+            </svg>
+            <span class="chip-label">{selectedModel?.name ?? 'Default model'}</span>
+            <svg class="chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+        {/if}
+        {#if prompts.length > 0}
+          <button
+            class="chip"
+            class:selected={!!selectedPrompt}
+            class:open={openPicker === 'prompt'}
+            onclick={() => togglePicker('prompt')}
+            title="Apply one of your Open WebUI prompts to the text"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 17l6-6-6-6" /><path d="M12 19h8" />
+            </svg>
+            <span class="chip-label">{selectedPrompt?.name ?? 'No prompt'}</span>
+            <svg class="chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+        {/if}
+
+        <span class="context-note">
+          {#if images.length > 0 && hasTarget}
+            Screenshots go to a new default chat
+          {:else}
+            <kbd>↵</kbd> {MODE_LABEL[submitMode]} · <kbd>⇧</kbd> {MODE_LABEL[otherMode]}
+          {/if}
+        </span>
+      </div>
+
+      {#if openPicker}
+        <div class="picker-panel">
+          <input
+            bind:this={pickerInputEl}
+            bind:value={pickerFilter}
+            class="picker-search"
+            type="text"
+            placeholder={openPicker === 'folder'
+              ? 'Search folders…'
+              : openPicker === 'model'
+                ? 'Search models and experts…'
+                : 'Search prompts…'}
+            autocomplete="off"
+            spellcheck="false"
+            oninput={() => (pickerIndex = 0)}
+            onkeydown={onPickerKeydown}
+          />
+          <div class="picker-list" bind:this={pickerListEl}>
+            {#each pickerItems as item, i (item.id ?? '__none')}
+              <button
+                class="picker-item"
+                class:active={i === pickerIndex}
+                class:current={item.id === currentId(openPicker)}
+                data-index={i}
+                onmouseenter={() => (pickerIndex = i)}
+                onclick={() => choose(item)}
+              >
+                <span class="picker-item-label" class:muted={item.id === null}>{item.label}</span>
+                {#if item.badge}<span class="picker-badge">{item.badge}</span>{/if}
+                {#if item.sub}<span class="picker-item-sub">{item.sub}</span>{/if}
+              </button>
+            {:else}
+              <div class="picker-empty">No match</div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    {/if}
   </div>
 
   <!-- Screenshot hint -->
@@ -420,6 +707,149 @@
       background: #fafafa;
       color: #1d1d1f;
     }
+  }
+
+  /* ─── Folder / Model pickers ─── */
+  .context-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 12px 10px 12px;
+    margin-top: -4px;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 200px;
+    flex-shrink: 0;
+    height: 26px;
+    padding: 0 8px 0 9px;
+    border: none;
+    outline: none;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    background: rgba(0, 0, 0, 0.04);
+    color: rgba(0, 0, 0, 0.5);
+  }
+  .chip:hover, .chip.open, .chip:focus-visible { background: rgba(0, 0, 0, 0.08); color: rgba(0, 0, 0, 0.75); }
+  .chip.selected { color: #1d1d1f; background: rgba(0, 0, 0, 0.08); }
+  .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chev { flex-shrink: 0; opacity: 0.6; }
+
+  .source-app {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 15px 0;
+    font-size: 12.5px;
+    color: rgba(0, 0, 0, 0.5);
+  }
+  .source-app img { width: 16px; height: 16px; object-fit: contain; }
+  .source-app strong { font-weight: 600; color: rgba(0, 0, 0, 0.75); }
+
+  .context-note kbd {
+    font-family: inherit;
+    font-size: 11px;
+    padding: 0 4px;
+    border-radius: 4px;
+    border: 0.5px solid rgba(0, 0, 0, 0.15);
+  }
+
+  .context-note {
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11.5px;
+    color: rgba(0, 0, 0, 0.35);
+    white-space: nowrap;
+  }
+
+  .picker-panel {
+    border-top: 0.5px solid rgba(0, 0, 0, 0.08);
+    padding: 8px;
+    cursor: default;
+  }
+
+  .picker-search {
+    width: 100%;
+    height: 30px;
+    padding: 0 8px;
+    font-size: 13.5px;
+    border-radius: 7px;
+    background: rgba(0, 0, 0, 0.04);
+  }
+
+  .picker-list {
+    margin-top: 6px;
+    max-height: 232px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .picker-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    min-height: 30px;
+    padding: 6px 8px;
+    border: none;
+    outline: none;
+    border-radius: 7px;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    font-size: 13.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .picker-item.active { background: rgba(0, 0, 0, 0.06); }
+  .picker-item.current .picker-item-label { font-weight: 600; }
+  .picker-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .picker-item-label.muted { opacity: 0.55; }
+  .picker-item-sub {
+    margin-left: auto;
+    flex-shrink: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    opacity: 0.4;
+  }
+  .picker-badge {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background: rgba(0, 0, 0, 0.06);
+    opacity: 0.7;
+  }
+  .picker-empty { padding: 8px; font-size: 13px; opacity: 0.4; }
+
+  @media (prefers-color-scheme: dark) {
+    .chip { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.45); }
+    .chip:hover, .chip.open, .chip:focus-visible { background: rgba(255, 255, 255, 0.09); color: rgba(255, 255, 255, 0.8); }
+    .chip.selected { color: #fafafa; background: rgba(255, 255, 255, 0.09); }
+    .context-note { color: rgba(255, 255, 255, 0.3); }
+    .context-note kbd { border-color: rgba(255, 255, 255, 0.18); }
+    .source-app { color: rgba(255, 255, 255, 0.45); }
+    .source-app strong { color: rgba(255, 255, 255, 0.8); }
+    .picker-panel { border-top-color: rgba(255, 255, 255, 0.08); }
+    .picker-search { background: rgba(255, 255, 255, 0.05); }
+    .picker-item.active { background: rgba(255, 255, 255, 0.07); }
+    .picker-badge { background: rgba(255, 255, 255, 0.08); }
   }
 
   /* ─── Inline Attachments ─── */
